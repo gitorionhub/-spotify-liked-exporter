@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spotify Library Genre Enricher V2.1</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:860px;margin:0 auto;padding:24px;background:#121212;color:#fff}
+.card{background:#1f1f1f;border-radius:16px;padding:18px;margin:16px 0}
+button,input,select{width:100%;box-sizing:border-box;font-size:16px;border-radius:10px;padding:14px;margin:8px 0}
+button{border:0;background:#1ed760;color:#000;font-weight:800}
+button.secondary{background:#eee}
+button.danger{background:#ff6b6b}
+button:disabled{opacity:.5}
+code{word-break:break-all}
+#status{white-space:pre-wrap;line-height:1.45}
+small{color:#bbb}
+.progress{width:100%;background:#333;border-radius:999px;height:18px;overflow:hidden}
+.bar{height:18px;width:0;background:#1ed760}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat{background:#111;border-radius:12px;padding:12px}
+</style>
+</head>
+<body>
+<h1>Spotify Library Genre Enricher V2.1</h1>
+<p>Safer CSV loading, 20-song test mode, request timeouts, and partial downloads.</p>
+
+<div class="card">
+  <b>1. Upload CSV</b>
+  <input id="file" type="file" accept=".csv,text/csv">
+  <small>Use <code>spotify_liked_songs_clean.csv</code>. The file must show <code>10,089</code> rows before Start works.</small>
+</div>
+
+<div class="card">
+  <b>2. Run mode</b>
+  <select id="mode">
+    <option value="20">Test first 20 unfinished songs</option>
+    <option value="100">Test first 100 unfinished songs</option>
+    <option value="all">Run all unfinished songs</option>
+  </select>
+  <button id="start" disabled>Start / Resume</button>
+  <button id="pause" disabled class="secondary">Pause after current song</button>
+  <button id="download" disabled>Download Enriched CSV</button>
+  <button id="clear" class="danger">Clear progress/cache</button>
+</div>
+
+<div class="card">
+  <b>Progress</b>
+  <div class="progress"><div id="bar" class="bar"></div></div>
+  <div class="grid">
+    <div class="stat">Rows loaded<br><b id="rowsCount">0</b></div>
+    <div class="stat">Attempted<br><b id="attemptedCount">0</b></div>
+    <div class="stat">Matches<br><b id="matchCount">0</b></div>
+    <div class="stat">No match / errors<br><b id="missCount">0</b></div>
+  </div>
+  <div id="status">Ready. Upload CSV first.</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let rows = [], headers = [], running = false, currentIndex = 0;
+const CACHE_KEY = "orion_mb_cache_v21";
+const NEW_COLS = ["mb_match_score","mb_recording_id","mb_recording_title","mb_genres","mb_tags","genre_status","genre_confidence","genre_error"];
+
+function setStatus(s){ $("status").textContent=s; }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function norm(s){ return String(s||"").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g,"").replace(/[^\p{L}\p{N}]+/gu," ").trim(); }
+function firstArtist(s){ return String(s||"").split(";")[0].split(",")[0].trim(); }
+
+function parseCSV(text){
+  const out=[]; let row=[], cur="", q=false;
+  for(let i=0;i<text.length;i++){
+    const ch=text[i], nx=text[i+1];
+    if(q){
+      if(ch === '"' && nx === '"'){ cur+='"'; i++; }
+      else if(ch === '"'){ q=false; }
+      else cur += ch;
+    }else{
+      if(ch === '"') q=true;
+      else if(ch === ','){ row.push(cur); cur=""; }
+      else if(ch === '\n'){ row.push(cur); out.push(row); row=[]; cur=""; }
+      else if(ch !== '\r') cur += ch;
+    }
+  }
+  if(cur.length || row.length){ row.push(cur); out.push(row); }
+  return out;
+}
+function csvEscape(v){
+  const s=String(v??"");
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+}
+function toCSV(rows, headers){
+  return [headers.join(","), ...rows.map(r=>headers.map(h=>csvEscape(r[h])).join(","))].join("\n");
+}
+function download(name,text){
+  const blob=new Blob([text],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob); a.download=name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+function loadCache(){
+  try{return JSON.parse(localStorage.getItem(CACHE_KEY)||"{}");}catch(e){return {};}
+}
+function saveCache(cache){
+  try{localStorage.setItem(CACHE_KEY,JSON.stringify(cache));}catch(e){}
+}
+function counts(){
+  const attempted=rows.filter(r=>r.genre_status).length;
+  const matches=rows.filter(r=>["MATCH_WITH_TAGS","MATCH_NO_TAGS"].includes(r.genre_status)).length;
+  const miss=rows.filter(r=>["NO_MATCH","ERROR","TIMEOUT"].includes(r.genre_status)).length;
+  return {attempted,matches,miss};
+}
+function updateUI(extra=""){
+  const c=counts(), total=rows.length||1;
+  $("rowsCount").textContent=rows.length;
+  $("attemptedCount").textContent=c.attempted;
+  $("matchCount").textContent=c.matches;
+  $("missCount").textContent=c.miss;
+  $("bar").style.width=Math.round(c.attempted/total*100)+"%";
+  setStatus(`${extra}
+
+Rows loaded: ${rows.length}
+Attempted: ${c.attempted}/${rows.length}
+Matches: ${c.matches}
+No match/errors: ${c.miss}
+Current index: ${currentIndex}
+Running: ${running ? "yes" : "no"}`.trim());
+}
+async function fetchWithTimeout(url, opts={}, ms=12000){
+  const controller=new AbortController();
+  const id=setTimeout(()=>controller.abort(),ms);
+  try{
+    const r=await fetch(url,{...opts,signal:controller.signal});
+    clearTimeout(id); return r;
+  }catch(e){
+    clearTimeout(id);
+    if(e.name==="AbortError") throw new Error("TIMEOUT");
+    throw e;
+  }
+}
+function pickTags(obj){
+  const genres=(obj.genres||[]).map(g=>({name:g.name,count:g.count||0}));
+  const tags=(obj.tags||[]).map(t=>({name:t.name,count:t.count||0}));
+  const all=[...genres,...tags].filter(x=>x.name).sort((a,b)=>(b.count||0)-(a.count||0));
+  const seen=new Set(), names=[];
+  for(const x of all){
+    const n=x.name.toLowerCase();
+    if(!seen.has(n)){ seen.add(n); names.push(x.name); }
+    if(names.length>=12) break;
+  }
+  return {genres:genres.map(x=>x.name).slice(0,8), tags:names};
+}
+async function lookup(row){
+  const track=row.track_name||"";
+  const artist=firstArtist(row.artists||"");
+  const album=row.album||"";
+  const key=norm(track+"|"+artist+"|"+album);
+  const cache=loadCache();
+  if(cache[key]) return cache[key];
+
+  const q=[];
+  if(track) q.push(`recording:"${track.replaceAll('"','')}"`);
+  if(artist) q.push(`artist:"${artist.replaceAll('"','')}"`);
+  const url="https://musicbrainz.org/ws/2/recording/?query="+encodeURIComponent(q.join(" AND "))+"&fmt=json&limit=5&inc=genres+tags+artist-credits+releases";
+  let result;
+  try{
+    const r=await fetchWithTimeout(url,{headers:{"Accept":"application/json"}},12000);
+    if(!r.ok) throw new Error("HTTP_"+r.status);
+    const data=await r.json();
+    let best=null, bestScore=-1;
+    for(const rec of (data.recordings||[])){
+      let score=0;
+      const rt=norm(rec.title), tt=norm(track);
+      if(rt===tt) score+=5; else if(rt.includes(tt)||tt.includes(rt)) score+=2;
+      const ac=(rec["artist-credit"]||[]).map(a=>a.artist?.name||a.name||"").join(" ");
+      if(norm(ac).includes(norm(artist))) score+=4;
+      if(album && (rec.releases||[]).some(rel=>norm(rel.title)===norm(album))) score+=2;
+      if(score>bestScore){bestScore=score; best=rec;}
+    }
+    if(best && bestScore>=5){
+      const p=pickTags(best);
+      result={mb_match_score:bestScore,mb_recording_id:best.id||"",mb_recording_title:best.title||"",mb_genres:p.genres.join("; "),mb_tags:p.tags.join("; "),genre_status:p.tags.length?"MATCH_WITH_TAGS":"MATCH_NO_TAGS",genre_confidence:p.tags.length?Math.min(0.95,0.45+bestScore/20+Math.min(p.tags.length,6)*0.04).toFixed(3):"0.350",genre_error:""};
+    }else{
+      result={mb_match_score:bestScore,mb_recording_id:best?.id||"",mb_recording_title:best?.title||"",mb_genres:"",mb_tags:"",genre_status:"NO_MATCH",genre_confidence:"0",genre_error:""};
+    }
+  }catch(e){
+    result={mb_match_score:"",mb_recording_id:"",mb_recording_title:"",mb_genres:"",mb_tags:"",genre_status:e.message==="TIMEOUT"?"TIMEOUT":"ERROR",genre_confidence:"0",genre_error:e.message};
+  }
+  cache[key]=result; saveCache(cache); return result;
+}
+
+$("file").addEventListener("change", async e=>{
+  const f=e.target.files[0];
+  if(!f){ return; }
+  $("start").disabled=true;
+  setStatus("Reading CSV file…");
+  try{
+    const text=await f.text();
+    setStatus("Parsing CSV…");
+    const parsed=parseCSV(text);
+    if(parsed.length<2) throw new Error("CSV appears empty or unreadable.");
+    headers=parsed[0].map(h=>String(h||"").trim());
+    for(const required of ["track_name","artists","album"]){
+      if(!headers.includes(required)) throw new Error("Missing required column: "+required);
+    }
+    for(const c of NEW_COLS) if(!headers.includes(c)) headers.push(c);
+    rows=parsed.slice(1).filter(r=>r.some(x=>String(x||"").trim().length)).map(r=>{
+      const obj={}; parsed[0].forEach((h,i)=>obj[String(h||"").trim()]=r[i]??"");
+      for(const c of NEW_COLS) if(obj[c]===undefined) obj[c]="";
+      return obj;
+    });
+    currentIndex=0;
+    $("start").disabled = rows.length===0;
+    $("download").disabled = rows.length===0;
+    updateUI(`CSV loaded successfully: ${rows.length} songs.
+Run the 20-song test first.`);
+  }catch(err){
+    rows=[]; headers=[]; currentIndex=0;
+    $("start").disabled=true; $("download").disabled=true;
+    setStatus("CSV load failed: "+err.message);
+  }
+});
+
+$("start").onclick=async ()=>{
+  if(!rows.length){ setStatus("No rows loaded. Upload CSV again."); return; }
+  running=true; $("start").disabled=true; $("pause").disabled=false;
+  const mode=$("mode").value;
+  const max=mode==="all"?Infinity:parseInt(mode,10);
+  let runCount=0;
+
+  for(let i=currentIndex;i<rows.length;i++){
+    if(!running) break;
+    currentIndex=i;
+    const row=rows[i];
+    if(row.genre_status) continue;
+    if(runCount>=max) break;
+    runCount++;
+    updateUI(`Looking up ${i+1}/${rows.length}
+${row.track_name}
+${firstArtist(row.artists)}
+
+12-second timeout active.`);
+    const res=await lookup(row);
+    Object.assign(row,res);
+    currentIndex=i+1;
+    updateUI(`Finished ${row.track_name} — ${res.genre_status}${res.mb_tags ? "\nTags: "+res.mb_tags : ""}`);
+    await sleep(1300);
+  }
+  running=false; $("start").disabled=false; $("pause").disabled=true;
+  updateUI("Stopped/completed selected run mode. Download partial results or continue.");
+};
+
+$("pause").onclick=()=>{running=false; updateUI("Pause requested. Finishing current lookup, then stopping.");};
+$("download").onclick=()=>{if(rows.length) download("spotify_liked_songs_genre_enriched_v21.csv",toCSV(rows,headers));};
+$("clear").onclick=()=>{if(confirm("Clear MusicBrainz cache and current page data?")){localStorage.removeItem(CACHE_KEY);rows=[];headers=[];currentIndex=0;$("start").disabled=true;$("download").disabled=true;updateUI("Cleared. Upload CSV again.");}};
+</script>
+</body>
+</html>
