@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spotify Library Genre Enricher</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:820px;margin:0 auto;padding:24px;background:#121212;color:#fff}
+.card{background:#1f1f1f;border-radius:16px;padding:18px;margin:16px 0}
+button,input{width:100%;box-sizing:border-box;font-size:16px;border-radius:10px;padding:14px;margin:8px 0}
+button{border:0;background:#1ed760;color:#000;font-weight:700}
+button.secondary{background:#eee}
+button.danger{background:#ff6b6b}
+button:disabled{opacity:.5}
+code{word-break:break-all}
+#status{white-space:pre-wrap;line-height:1.45}
+small{color:#bbb}
+.progress{width:100%;background:#333;border-radius:999px;height:18px;overflow:hidden}
+.bar{height:18px;width:0;background:#1ed760}
+textarea{width:100%;min-height:100px;background:#111;color:#fff;border:1px solid #555;border-radius:10px;padding:12px}
+</style>
+</head>
+<body>
+<h1>Spotify Library Genre Enricher</h1>
+<p>Upload your clean Spotify CSV, enrich songs with public MusicBrainz genre/tag metadata, then download a new enriched CSV.</p>
+
+<div class="card">
+  <b>1. Upload your clean CSV</b>
+  <input id="file" type="file" accept=".csv,text/csv">
+  <small>Use <code>spotify_liked_songs_clean.csv</code> or your latest classification CSV if it still has track_name, artists, album, spotify_uri.</small>
+</div>
+
+<div class="card">
+  <b>2. Enrichment controls</b>
+  <button id="start" disabled>Start / Resume Genre Enrichment</button>
+  <button id="pause" disabled class="secondary">Pause</button>
+  <button id="download" disabled>Download Enriched CSV</button>
+  <button id="reset" class="danger">Reset Saved Progress</button>
+  <small>This uses rate-limited public lookups. For 10,000 songs, this can take hours. Keep Safari open.</small>
+</div>
+
+<div class="card">
+  <b>Progress</b>
+  <div class="progress"><div id="bar" class="bar"></div></div>
+  <div id="status">Ready. Upload CSV first.</div>
+</div>
+
+<div class="card">
+  <b>Notes</b>
+  <small>
+  This does not use your Spotify Client Secret or access token. It does not call Spotify.
+  MusicBrainz metadata coverage is imperfect, so the output includes confidence and source fields.
+  </small>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let rows = [];
+let headers = [];
+let running = false;
+let currentIndex = 0;
+const STORE_KEY = "orion_genre_enrichment_progress_v1";
+const CACHE_KEY = "orion_musicbrainz_cache_v1";
+
+function status(s){ $("status").textContent = s; }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+function parseCSV(text){
+  const out=[]; let row=[], cur="", q=false;
+  for(let i=0;i<text.length;i++){
+    const ch=text[i], nx=text[i+1];
+    if(q){
+      if(ch === '"' && nx === '"'){ cur+='"'; i++; }
+      else if(ch === '"'){ q=false; }
+      else cur+=ch;
+    }else{
+      if(ch === '"') q=true;
+      else if(ch === ','){ row.push(cur); cur=""; }
+      else if(ch === '\n'){ row.push(cur); out.push(row); row=[]; cur=""; }
+      else if(ch !== '\r') cur+=ch;
+    }
+  }
+  if(cur.length || row.length){ row.push(cur); out.push(row); }
+  return out;
+}
+function csvEscape(v){
+  const s = String(v ?? "");
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+}
+function toCSV(rows, headers){
+  return [headers.join(","), ...rows.map(r=>headers.map(h=>csvEscape(r[h])).join(","))].join("\n");
+}
+function download(name, text){
+  const blob = new Blob([text], {type:"text/csv;charset=utf-8"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+function loadCache(){
+  try{return JSON.parse(localStorage.getItem(CACHE_KEY)||"{}");}catch(e){return {};}
+}
+function saveCache(cache){ localStorage.setItem(CACHE_KEY, JSON.stringify(cache)); }
+function saveProgress(){
+  localStorage.setItem(STORE_KEY, JSON.stringify({headers, rows, currentIndex}));
+}
+function loadProgress(){
+  try{
+    const x = JSON.parse(localStorage.getItem(STORE_KEY)||"null");
+    if(x && x.rows && x.headers){ headers=x.headers; rows=x.rows; currentIndex=x.currentIndex||0; return true; }
+  }catch(e){}
+  return false;
+}
+function updateProgress(){
+  const done = rows.filter(r => r.genre_status).length;
+  const total = rows.length || 1;
+  $("bar").style.width = Math.round(done/total*100) + "%";
+  status(`Rows loaded: ${rows.length}
+Enriched/attempted: ${done}/${rows.length}
+Current index: ${currentIndex}
+Running: ${running ? "yes" : "no"}
+
+Tip: You can pause and download a partial file anytime.`);
+}
+function norm(s){ return String(s||"").toLowerCase().replace(/[^\p{L}\p{N}]+/gu," ").trim(); }
+function firstArtist(artists){
+  return String(artists||"").split(";")[0].split(",")[0].trim();
+}
+function mbQuery(track, artist){
+  const parts=[];
+  if(track) parts.push(`recording:"${track.replaceAll('"','')}"`);
+  if(artist) parts.push(`artist:"${artist.replaceAll('"','')}"`);
+  return parts.join(" AND ");
+}
+function pickTags(obj){
+  const tags = [];
+  const genres = [];
+  if(obj.genres) for(const g of obj.genres) genres.push({name:g.name, count:g.count||0});
+  if(obj.tags) for(const t of obj.tags) tags.push({name:t.name, count:t.count||0});
+  const all = [...genres, ...tags]
+    .filter(x=>x.name)
+    .sort((a,b)=>(b.count||0)-(a.count||0));
+  const seen=new Set(), names=[];
+  for(const x of all){
+    const n=x.name.toLowerCase();
+    if(!seen.has(n)){ seen.add(n); names.push(x.name); }
+    if(names.length>=10) break;
+  }
+  return {genres:genres.map(x=>x.name).slice(0,8), tags:names};
+}
+async function musicbrainzLookup(track, artist, album){
+  const key = norm(track+"|"+artist+"|"+album);
+  const cache = loadCache();
+  if(cache[key]) return cache[key];
+
+  const query = mbQuery(track, artist);
+  const url = "https://musicbrainz.org/ws/2/recording/?query=" + encodeURIComponent(query) + "&fmt=json&limit=5&inc=genres+tags+artist-credits+releases";
+  const r = await fetch(url, {headers:{"Accept":"application/json"}});
+  if(!r.ok) throw new Error("MusicBrainz error " + r.status);
+  const data = await r.json();
+  const recs = data.recordings || [];
+  let best = null, score = -1;
+
+  for(const rec of recs){
+    const rt = norm(rec.title);
+    const target = norm(track);
+    let s = 0;
+    if(rt === target) s += 5;
+    else if(rt.includes(target) || target.includes(rt)) s += 2;
+
+    const ac = (rec["artist-credit"]||[]).map(a=>a.artist?.name||a.name||"").join(" ");
+    const na = norm(ac);
+    const aa = norm(artist);
+    if(aa && na.includes(aa)) s += 4;
+
+    const releases = rec.releases || [];
+    if(album && releases.some(rel=>norm(rel.title)===norm(album))) s += 2;
+
+    if(s > score){ score=s; best=rec; }
+  }
+
+  let result = {
+    mb_match_score: score,
+    mb_recording_id: best?.id || "",
+    mb_recording_title: best?.title || "",
+    mb_genres: "",
+    mb_tags: "",
+    genre_status: "NO_MATCH",
+    genre_confidence: 0
+  };
+
+  if(best && score >= 5){
+    const picked = pickTags(best);
+    result.mb_genres = picked.genres.join("; ");
+    result.mb_tags = picked.tags.join("; ");
+    result.genre_status = picked.tags.length ? "MATCH_WITH_TAGS" : "MATCH_NO_TAGS";
+    result.genre_confidence = picked.tags.length ? Math.min(0.95, 0.45 + score/20 + Math.min(picked.tags.length,6)*0.04) : 0.35;
+  }
+
+  cache[key] = result;
+  saveCache(cache);
+  return result;
+}
+
+$("file").onchange = async e => {
+  const f = e.target.files[0];
+  if(!f) return;
+  const text = await f.text();
+  const arr = parseCSV(text);
+  headers = arr[0].map(x=>x.trim());
+  rows = arr.slice(1).filter(r=>r.length && r.some(x=>x)).map(r=>{
+    const obj={};
+    headers.forEach((h,i)=>obj[h]=r[i] ?? "");
+    return obj;
+  });
+  const newCols = ["mb_match_score","mb_recording_id","mb_recording_title","mb_genres","mb_tags","genre_status","genre_confidence","genre_error"];
+  for(const c of newCols){ if(!headers.includes(c)) headers.push(c); }
+  currentIndex = 0;
+  $("start").disabled = false;
+  $("download").disabled = false;
+  saveProgress();
+  updateProgress();
+};
+
+$("start").onclick = async () => {
+  if(!rows.length && !loadProgress()) return status("No rows loaded. Upload a CSV first.");
+  running = true;
+  $("start").disabled = true; $("pause").disabled = false; $("download").disabled = false;
+
+  for(let i=currentIndex; i<rows.length; i++){
+    if(!running){ currentIndex=i; saveProgress(); updateProgress(); return; }
+    currentIndex=i;
+    const row = rows[i];
+    if(row.genre_status){ updateProgress(); continue; }
+
+    const track = row.track_name || row.track || row.name || "";
+    const artist = firstArtist(row.artists || row.artist || "");
+    const album = row.album || "";
+    try{
+      status(`Looking up ${i+1}/${rows.length}
+${track}
+${artist}
+
+Keep Safari open.`);
+      const res = await musicbrainzLookup(track, artist, album);
+      Object.assign(row,res);
+    }catch(e){
+      row.genre_status = "ERROR";
+      row.genre_error = e.message;
+    }
+
+    if(i % 10 === 0) saveProgress();
+    updateProgress();
+
+    // MusicBrainz asks API clients to be gentle. 1.2 seconds keeps us conservative.
+    await sleep(1200);
+  }
+  running = false;
+  currentIndex = rows.length;
+  saveProgress();
+  $("start").disabled = false; $("pause").disabled = true;
+  updateProgress();
+  status(`Done. Enriched/attempted ${rows.length} rows. Download the enriched CSV.`);
+};
+
+$("pause").onclick = () => {
+  running = false;
+  $("start").disabled = false;
+  $("pause").disabled = true;
+  saveProgress();
+  updateProgress();
+};
+
+$("download").onclick = () => {
+  if(!rows.length && !loadProgress()) return status("No data to download.");
+  download("spotify_liked_songs_genre_enriched.csv", toCSV(rows, headers));
+};
+
+$("reset").onclick = () => {
+  if(confirm("Reset saved enrichment progress on this iPhone browser?")){
+    localStorage.removeItem(STORE_KEY);
+    localStorage.removeItem(CACHE_KEY);
+    rows=[]; headers=[]; currentIndex=0; running=false;
+    $("start").disabled=true; $("pause").disabled=true; $("download").disabled=true;
+    $("bar").style.width="0%";
+    status("Progress reset. Upload CSV again.");
+  }
+};
+
+if(loadProgress()){
+  $("start").disabled=false; $("download").disabled=false;
+  updateProgress();
+}
+</script>
+</body>
+</html>
